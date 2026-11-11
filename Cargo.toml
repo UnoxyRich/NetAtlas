@@ -1,0 +1,18 @@
+[package]
+name = "netatlas"
+version = "0.2.0"
+edition = "2021"
+description = "Live local network map in your terminal"
+license = "GPL-3.0-only"
+
+[dependencies]
+crossterm = "0.28"
+ratatui = "0.29"
+if-addrs = "0.13"
+mdns-sd = "0.13"
+crossbeam-channel = "0.5"
+oui-data = "0.2.4"
+pnet_datalink = "0.35"
+pnet_packet = "0.35"
+roxmltree = "0.20"
+csv = "1.4"

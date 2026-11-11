@@ -1,0 +1,20 @@
+node_modules/
+dist/
+dist-electron/
+release/
+coverage/
+.vite/
+.DS_Store
+*.log
+*.tsbuildinfo
+.env
+.env.*
+!.env.example
+*.sqlite
+*.sqlite-journal
+resources/tools/
+assets/netatlas-icon.png
+assets/netatlas.iconset/
+
+# Rust build artifacts
+/target/
