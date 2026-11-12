@@ -13,7 +13,7 @@ use pnet_packet::{
 use std::{
     collections::{HashMap, HashSet},
     io::Read,
-    net::{Ipv4Addr, UdpSocket},
+    net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
     process::{Command, Stdio},
     sync::{
         atomic::{AtomicBool, Ordering},
@@ -71,6 +71,7 @@ pub struct Network {
     pub mask: Ipv4Addr,
     pub gateway: Option<Ipv4Addr>,
     pub vlan: Option<String>,
+    pub routed: bool,
 }
 impl Network {
     pub fn prefix(&self) -> u32 {
@@ -106,6 +107,7 @@ impl Default for Snapshot {
 }
 pub(crate) enum Message {
     Found(Observation),
+    Probe(Ipv4Addr, String),
     Enriched(Observation),
     ServiceGone(Ipv4Addr, String, String),
     ScanStatus(Ipv4Addr, String, Option<String>, String),
@@ -113,6 +115,7 @@ pub(crate) enum Message {
     Status(String),
     Warning(String),
     Networks(Vec<Network>),
+    SubnetWarnings(Vec<String>),
 }
 pub struct Scanner {
     pub updates: Receiver<Snapshot>,
@@ -120,11 +123,11 @@ pub struct Scanner {
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Scanner {
-    pub fn start() -> Self {
+    pub fn start(extra_subnets: Vec<String>) -> Self {
         let (out, updates) = bounded(1);
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
-        let worker = thread::spawn(move || controller(out, s));
+        let worker = thread::spawn(move || controller(out, s, extra_subnets));
         Self {
             updates,
             stop,
@@ -140,12 +143,13 @@ impl Drop for Scanner {
         }
     }
 }
-fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>) {
+fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: Vec<String>) {
     let (tx, rx) = unbounded();
     type Job = (Ipv4Addr, String, Option<String>);
     let (jobs, jobs_rx) = bounded::<Job>(4096);
     let (deep_jobs, deep_rx) = bounded::<Job>(4096);
     let (ping_jobs, ping_rx) = bounded::<Job>(4096);
+    let (name_jobs, name_rx) = bounded::<Job>(4096);
     let nmap_version = Command::new("nmap")
         .arg("--version")
         .stderr(Stdio::null())
@@ -162,29 +166,34 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>) {
         .ok()
         .is_some_and(|o| String::from_utf8_lossy(&o.stdout).trim() == "0");
     let mut workers = Vec::new();
-    for _ in 0..4 {
+    for _ in 0..32 {
         let (tx, stop, rx, deep) = (tx.clone(), stop.clone(), jobs_rx.clone(), deep_jobs.clone());
         workers.push(thread::spawn(move || {
             fingerprint_worker(rx, deep, tx, stop, has_nmap)
         }));
     }
-    for _ in 0..8 {
+    for _ in 0..32 {
         let (tx, stop, rx) = (tx.clone(), stop.clone(), deep_rx.clone());
         workers.push(thread::spawn(move || deep_worker(rx, tx, stop, privileged)));
     }
-    for _ in 0..4 {
+    for _ in 0..32 {
+        let (tx, stop, rx) = (tx.clone(), stop.clone(), name_rx.clone());
+        workers.push(thread::spawn(move || name_worker(rx, tx, stop)));
+    }
+    for _ in 0..128 {
         let (tx, stop, rx) = (tx.clone(), stop.clone(), ping_rx.clone());
         workers.push(thread::spawn(move || ping_worker(rx, tx, stop)));
     }
     {
         let tx = tx.clone();
         let stop = stop.clone();
-        workers.push(thread::spawn(move || discovery_loop(tx, stop)));
+        let subnets = extra_subnets.clone();
+        workers.push(thread::spawn(move || discovery_loop(tx, stop, subnets)));
     }
     {
         let tx = tx.clone();
         let stop = stop.clone();
-        workers.push(thread::spawn(move || mdns_loop(tx, stop)));
+        workers.push(thread::spawn(move || mdns_loop(tx, stop, extra_subnets)));
     }
     {
         let tx = tx.clone();
@@ -213,6 +222,16 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         if let Ok(message) = rx.recv_timeout(Duration::from_millis(1)) {
             match message {
+                Message::Probe(ip, iface) => {
+                    let key = (ip, iface.clone());
+                    if pinged
+                        .get(&key)
+                        .is_none_or(|t| t.elapsed() > Duration::from_secs(30))
+                        && ping_jobs.try_send((ip, iface, None)).is_ok()
+                    {
+                        pinged.insert(key, Instant::now());
+                    }
+                }
                 Message::Found(o) => {
                     let key = (o.ip, o.interface.clone());
                     let local = o.local;
@@ -241,6 +260,7 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>) {
                     }
                     if queue_scan && jobs.try_send(job.clone()).is_ok() {
                         inflight.insert(key.clone());
+                        let _ = name_jobs.try_send(job.clone());
                         if has_nmap {
                             store.set_scan_status_for(
                                 key.0,
@@ -268,6 +288,10 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>) {
                 }
                 Message::Networks(n) => {
                     snap.networks = n;
+                }
+                Message::SubnetWarnings(warnings) => {
+                    snap.warnings.retain(|w| !w.starts_with("Subnet "));
+                    snap.warnings.extend(warnings);
                 }
                 Message::Status(s) => snap.status = s,
                 Message::Warning(w) => {
@@ -455,6 +479,7 @@ pub(crate) fn networks() -> Vec<Network> {
                 mask: v4.netmask,
                 gateway,
                 vlan: vlan(&a.name),
+                routed: false,
             });
         }
     }
@@ -465,11 +490,18 @@ pub(crate) fn networks() -> Vec<Network> {
     });
     out
 }
-fn targets(n: &Network) -> (Vec<Ipv4Addr>, bool) {
+fn targets_chunk(n: &Network, cycle: u32) -> (Vec<Ipv4Addr>, bool) {
     let limited = n.prefix() < 20;
     let p = if limited { 24 } else { n.prefix() };
     let mask = u32::MAX.checked_shl(32 - p).unwrap_or(0);
-    let first = u32::from(n.address) & mask;
+    let mut first = u32::from(n.address) & mask;
+    if limited {
+        let network_mask = u32::from(n.mask);
+        let base = u32::from(n.address) & network_mask;
+        let blocks = (1u64 << (24 - n.prefix())) as u32;
+        let local = (first - base) >> 8;
+        first = base + ((local + cycle % blocks) % blocks) * 256;
+    }
     let last = first | !mask;
     let (first, last) = if p >= 31 {
         (first, last)
@@ -478,9 +510,25 @@ fn targets(n: &Network) -> (Vec<Ipv4Addr>, bool) {
     };
     ((first..=last).map(Ipv4Addr::from).collect(), limited)
 }
-fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
+fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>, extra_subnets: Vec<String>) {
+    let mut cycles = HashMap::<(String, String), u32>::new();
     while !stop.load(Ordering::Relaxed) {
-        let nets = networks();
+        let mut nets = networks();
+        let routed = crate::routes::discover(&nets, &extra_subnets);
+        nets.extend(routed);
+        let warnings = extra_subnets
+            .iter()
+            .filter_map(|requested| {
+                let (address, prefix) = crate::routes::parse_subnet(requested).ok()?;
+                (!nets
+                    .iter()
+                    .any(|n| n.contains(address) && n.prefix() <= prefix))
+                .then(|| {
+                    format!("Subnet {requested}: no route through an active Ethernet interface")
+                })
+            })
+            .collect();
+        let _ = tx.send(Message::SubnetWarnings(warnings));
         let _ = tx.send(Message::Networks(nets.clone()));
         if nets.is_empty() {
             let _ = tx.send(Message::Status("No active IPv4 Ethernet interfaces".into()));
@@ -491,12 +539,30 @@ fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
             if stop.load(Ordering::Relaxed) {
                 break;
             }
-            let (hosts, limited) = targets(n);
+            let cycle = cycles.entry((n.interface.clone(), n.cidr())).or_default();
+            let (hosts, limited) = targets_chunk(n, *cycle);
+            *cycle = cycle.wrapping_add(1);
             if limited {
                 let _ = tx.send(Message::Warning(format!(
-                    "{}: large subnet limited to local /24",
+                    "{}: rotating through large subnet in /24 blocks",
                     n.interface
                 )));
+            }
+            if n.routed {
+                let _ = tx.send(Message::Status(format!(
+                    "Scanning routed {} · {} targets · up to {} IP/s",
+                    n.cidr(),
+                    hosts.len(),
+                    RATE
+                )));
+                for ip in hosts {
+                    if stop.load(Ordering::Relaxed) {
+                        break;
+                    }
+                    let _ = tx.send(Message::Probe(ip, n.interface.clone()));
+                    thread::sleep(Duration::from_millis(1000 / RATE));
+                }
+                continue;
             }
             let mut me = Observation::new(n.address, &n.interface);
             me.local = true;
@@ -504,7 +570,7 @@ fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
             me.mac = datalink::interfaces()
                 .iter()
                 .find(|i| i.name == n.interface)
-                .and_then(|i| i.mac)
+                .and_then(interface_mac)
                 .map(|m| m.to_string().to_uppercase());
             let _ = tx.send(Message::Found(me));
             let _ = tx.send(Message::Status(format!(
@@ -515,7 +581,11 @@ fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
             )));
             let iface = datalink::interfaces()
                 .into_iter()
-                .find(|i| i.name == n.interface);
+                .find(|i| i.name == n.interface)
+                .map(|mut i| {
+                    i.mac = interface_mac(&i);
+                    i
+                });
             let raw_ok = match iface.and_then(|i| open_channel(&i).map(|c| (i, c))) {
                 Some((iface, (sender, receiver))) => {
                     arp_sweep(n, &iface, &hosts, sender, receiver, &tx, &stop)
@@ -523,10 +593,36 @@ fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
                 None => false,
             };
             if !raw_ok && !stop.load(Ordering::Relaxed) {
-                let _=tx.send(Message::Warning("ARP unavailable: using neighbor cache, which may be stale; run with sudo for live replies".into()));
+                let _=tx.send(Message::Warning("ARP unavailable: using ICMP, TCP and neighbor cache; run with sudo for live ARP".into()));
                 fallback_sweep(n, hosts, &tx, &stop);
             }
         }
+    }
+}
+fn interface_mac(interface: &NetworkInterface) -> Option<pnet_datalink::MacAddr> {
+    let mac = interface.mac;
+    // macOS can return this privacy placeholder through the datalink API.
+    if mac.is_some_and(|m| m.to_string() != "02:00:00:00:00:00") {
+        return mac;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let output = Command::new("/sbin/ifconfig")
+            .arg(&interface.name)
+            .output()
+            .ok()?;
+        let text = String::from_utf8_lossy(&output.stdout);
+        text.lines()
+            .find_map(|line| {
+                line.trim()
+                    .strip_prefix("ether ")
+                    .and_then(|m| m.trim().parse().ok())
+            })
+            .filter(|m: &pnet_datalink::MacAddr| m.to_string() != "02:00:00:00:00:00")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        None
     }
 }
 fn open_channel(
@@ -551,9 +647,11 @@ fn arp_sweep(
     stop: &AtomicBool,
 ) -> bool {
     let Some(mac) = iface.mac else { return false };
+    let gateway_mac = cached_gateway_mac(n);
     let mut index = 0;
     let mut next = Instant::now();
     let mut done = None;
+    let mut replies = HashMap::<String, HashSet<Ipv4Addr>>::new();
     while !stop.load(Ordering::Relaxed) {
         if index < hosts.len() && Instant::now() >= next {
             let ip = hosts[index];
@@ -600,10 +698,10 @@ fn arp_sweep(
                             && arp.get_target_proto_addr() == n.address
                             && source != mac
                         {
-                            let mut o = Observation::new(ip, &n.interface);
-                            o.mac = Some(source.to_string().to_uppercase());
-                            o.gateway = n.gateway == Some(ip);
-                            let _ = tx.send(Message::Found(o));
+                            replies
+                                .entry(source.to_string().to_uppercase())
+                                .or_default()
+                                .insert(ip);
                         }
                     }
                 }
@@ -613,7 +711,46 @@ fn arp_sweep(
             break;
         }
     }
-    true
+    let received = !replies.is_empty();
+    publish_arp_replies(n, replies, gateway_mac.as_deref(), tx);
+    received
+}
+fn publish_arp_replies(
+    n: &Network,
+    replies: HashMap<String, HashSet<Ipv4Addr>>,
+    gateway_mac: Option<&str>,
+    tx: &Sender<Message>,
+) {
+    for (mac, ips) in replies {
+        let shared = ips.len() > 1 || gateway_mac == Some(mac.as_str());
+        for ip in ips {
+            if shared && n.gateway != Some(ip) {
+                let _ = tx.send(Message::Probe(ip, n.interface.clone()));
+            } else {
+                let mut o = Observation::new(ip, &n.interface);
+                o.mac = Some(mac.clone());
+                o.gateway = n.gateway == Some(ip);
+                let _ = tx.send(Message::Found(o));
+            }
+        }
+    }
+}
+fn cached_gateway_mac(n: &Network) -> Option<String> {
+    let gateway = n.gateway?;
+    #[cfg(target_os = "macos")]
+    let result = Command::new("/usr/sbin/arp")
+        .args(["-an", "-i", &n.interface])
+        .output();
+    #[cfg(target_os = "linux")]
+    let result = Command::new("ip")
+        .args(["neigh", "show", "dev", &n.interface])
+        .output();
+    #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+    let result: std::io::Result<std::process::Output> = Err(std::io::Error::other("unsupported"));
+    parse_neighbors(&String::from_utf8_lossy(&result.ok()?.stdout))
+        .into_iter()
+        .find(|(ip, _, _)| *ip == gateway)
+        .map(|(_, mac, _)| mac)
 }
 fn fallback_sweep(n: &Network, hosts: Vec<Ipv4Addr>, tx: &Sender<Message>, stop: &AtomicBool) {
     let Ok(sock) = UdpSocket::bind((n.address, 0)) else {
@@ -624,6 +761,9 @@ fn fallback_sweep(n: &Network, hosts: Vec<Ipv4Addr>, tx: &Sender<Message>, stop:
             return;
         }
         let _ = sock.send_to(&[0], (ip, 9));
+        if ip != n.address {
+            let _ = tx.send(Message::Probe(ip, n.interface.clone()));
+        }
         thread::sleep(Duration::from_millis(1000 / RATE));
     }
     #[cfg(target_os = "macos")]
@@ -637,15 +777,32 @@ fn fallback_sweep(n: &Network, hosts: Vec<Ipv4Addr>, tx: &Sender<Message>, stop:
     #[cfg(not(any(target_os = "macos", target_os = "linux")))]
     let result: std::io::Result<std::process::Output> = Err(std::io::Error::other("unsupported"));
     if let Ok(out) = result {
-        for (ip, mac, name) in parse_neighbors(&String::from_utf8_lossy(&out.stdout)) {
+        let neighbors = parse_neighbors(&String::from_utf8_lossy(&out.stdout));
+        let gateway_mac = neighbors
+            .iter()
+            .find(|(ip, _, _)| Some(*ip) == n.gateway)
+            .map(|(_, mac, _)| mac.clone());
+        let mut counts = HashMap::<String, usize>::new();
+        for (ip, mac, _) in &neighbors {
+            if n.contains(*ip) {
+                *counts.entry(mac.clone()).or_default() += 1;
+            }
+        }
+        for (ip, mac, name) in neighbors {
             if n.contains(ip) {
-                let mut o = Observation::new(ip, &n.interface);
-                o.mac = Some(mac);
-                o.name = name;
-                // A cached neighbor may be stale; ICMP or an open TCP port confirms presence.
-                o.confirmed = false;
-                o.gateway = n.gateway == Some(ip);
-                let _ = tx.send(Message::Found(o));
+                if (counts.get(&mac).copied().unwrap_or(0) > 1
+                    || gateway_mac.as_deref() == Some(mac.as_str()))
+                    && n.gateway != Some(ip)
+                {
+                    let _ = tx.send(Message::Probe(ip, n.interface.clone()));
+                } else {
+                    let mut o = Observation::new(ip, &n.interface);
+                    o.mac = Some(mac);
+                    o.name = name;
+                    o.confirmed = false;
+                    o.gateway = n.gateway == Some(ip);
+                    let _ = tx.send(Message::Found(o));
+                }
             }
         }
     }
@@ -679,7 +836,11 @@ fn parse_neighbors(output: &str) -> Vec<(Ipv4Addr, String, Option<String>)> {
                 .map(|s| u8::from_str_radix(s, 16))
                 .collect::<Result<_, _>>()
                 .ok()?;
-            if parts.len() != 6 || parts[0] & 1 != 0 || parts.iter().all(|b| *b == 0) {
+            if parts.len() != 6
+                || parts[0] & 1 != 0
+                || parts.iter().all(|b| *b == 0)
+                || parts == [2, 0, 0, 0, 0, 0]
+            {
                 return None;
             }
             Some((
@@ -694,7 +855,7 @@ fn parse_neighbors(output: &str) -> Vec<(Ipv4Addr, String, Option<String>)> {
         })
         .collect()
 }
-fn mdns_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
+fn mdns_loop(tx: Sender<Message>, stop: Arc<AtomicBool>, extra_subnets: Vec<String>) {
     let Ok(daemon) = ServiceDaemon::new() else {
         let _ = tx.send(Message::Warning("mDNS unavailable".into()));
         return;
@@ -711,6 +872,7 @@ fn mdns_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
     while !stop.load(Ordering::Relaxed) {
         if Instant::now() >= next {
             nets = networks();
+            nets.extend(crate::routes::discover(&nets, &extra_subnets));
             next = Instant::now() + Duration::from_secs(15);
         }
         if let Some(meta) = &meta {
@@ -736,7 +898,14 @@ fn mdns_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
                         let key = info.get_fullname().to_ascii_lowercase();
                         let mut mappings = Vec::new();
                         for ip in info.get_addresses_v4() {
-                            for n in nets.iter().filter(|n| n.contains(*ip)) {
+                            for n in nets.iter().filter(|n| {
+                                n.contains(*ip)
+                                    && !nets.iter().any(|other| {
+                                        other.interface == n.interface
+                                            && other.contains(*ip)
+                                            && other.prefix() > n.prefix()
+                                    })
+                            }) {
                                 let mut o = Observation::new(*ip, &n.interface);
                                 o.confirmed = false; // Bonjour sleep proxies may answer for another device.
                                 let hostname = info.get_hostname().trim_end_matches('.');
@@ -791,7 +960,7 @@ fn mdns_loop(tx: Sender<Message>, stop: Arc<AtomicBool>) {
                                 mappings.push((*ip, n.interface.clone(), service.clone()));
                                 o.services.push(service);
                                 o.gateway = n.gateway == Some(*ip);
-                                o.local = n.address == *ip;
+                                o.local = !n.routed && n.address == *ip;
                                 let _ = tx.send(Message::Found(o));
                             }
                         }
@@ -842,31 +1011,6 @@ fn fingerprint_worker(
         let Ok((ip, iface, mac)) = rx.recv_timeout(Duration::from_millis(100)) else {
             continue;
         };
-        if let Some(name) = system_reverse_name(ip, &stop) {
-            let mut o = Observation::new(ip, &iface);
-            o.mac = mac.clone();
-            o.name = Some(name);
-            let _ = tx.send(Message::Enriched(o));
-        }
-        if let Ok(output) = Command::new("dig")
-            .args(["+time=1", "+tries=1", "+short", "-x", &ip.to_string()])
-            .stderr(Stdio::null())
-            .output()
-        {
-            let name = String::from_utf8_lossy(&output.stdout)
-                .lines()
-                .next()
-                .unwrap_or("")
-                .trim()
-                .trim_end_matches('.')
-                .to_owned();
-            if !name.is_empty() && !name.starts_with(';') {
-                let mut o = Observation::new(ip, &iface);
-                o.mac = mac.clone();
-                o.name = Some(name);
-                let _ = tx.send(Message::Enriched(o));
-            }
-        }
         if !has_nmap || stop.load(Ordering::Relaxed) {
             let _ = tx.send(Message::ScanDone(ip, iface, mac));
             continue;
@@ -907,6 +1051,46 @@ fn fingerprint_worker(
                     "Deep scan queue full".into(),
                 ));
                 let _ = tx.send(Message::ScanDone(ip, iface, mac));
+            }
+        }
+    }
+}
+fn name_worker(rx: Receiver<ScanJob>, tx: Sender<Message>, stop: Arc<AtomicBool>) {
+    while !stop.load(Ordering::Relaxed) {
+        let Ok((ip, iface, mac)) = rx.recv_timeout(Duration::from_millis(100)) else {
+            continue;
+        };
+        if let Some(name) = crate::netbios::lookup(ip) {
+            let mut o = Observation::new(ip, &iface);
+            o.mac = mac.clone();
+            o.findings
+                .push(format!("NetBIOS name: {name} (advertised)"));
+            o.friendly_name = Some(name);
+            let _ = tx.send(Message::Enriched(o));
+        }
+        if let Some(name) = system_reverse_name(ip, &stop) {
+            let mut o = Observation::new(ip, &iface);
+            o.mac = mac.clone();
+            o.name = Some(name);
+            let _ = tx.send(Message::Enriched(o));
+        }
+        if let Ok(output) = Command::new("dig")
+            .args(["+time=1", "+tries=1", "+short", "-x", &ip.to_string()])
+            .stderr(Stdio::null())
+            .output()
+        {
+            let name = String::from_utf8_lossy(&output.stdout)
+                .lines()
+                .next()
+                .unwrap_or("")
+                .trim()
+                .trim_end_matches('.')
+                .to_owned();
+            if !name.is_empty() && !name.starts_with(';') {
+                let mut o = Observation::new(ip, &iface);
+                o.mac = mac.clone();
+                o.name = Some(name);
+                let _ = tx.send(Message::Enriched(o));
             }
         }
     }
@@ -1241,14 +1425,27 @@ fn ping_worker(rx: Receiver<ScanJob>, tx: Sender<Message>, stop: Arc<AtomicBool>
         let wait = "1000";
         #[cfg(not(target_os = "macos"))]
         let wait = "1";
-        if Command::new("ping")
+        let ping_ok = Command::new("ping")
             .args(["-n", "-c", "1", "-W", wait, &ip.to_string()])
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .status()
-            .is_ok_and(|s| s.success())
-        {
-            // An ICMP reply proves the IP responded, not which MAC owns it.
+            .is_ok_and(|s| s.success());
+        let tcp_ok = !ping_ok
+            && [22, 80, 443, 445, 548, 3389, 5000, 7000, 62078]
+                .iter()
+                .any(|port| {
+                    if stop.load(Ordering::Relaxed) {
+                        return false;
+                    }
+                    TcpStream::connect_timeout(
+                        &SocketAddr::from((ip, *port)),
+                        Duration::from_millis(120),
+                    )
+                    .is_ok()
+                });
+        if ping_ok || tcp_ok {
+            // An ICMP or TCP reply proves the IP responded, not which MAC owns it.
             let o = Observation::new(ip, &iface);
             let _ = tx.send(Message::Found(o));
         }
@@ -1270,7 +1467,86 @@ mod tests {
             mask: "255.255.255.0".parse().unwrap(),
             gateway: None,
             vlan: None,
+            routed: false,
         }
+    }
+    #[test]
+    fn fallback_probes_addresses_even_when_neighbor_cache_is_empty() {
+        let n = Network {
+            interface: "lo0".into(),
+            address: Ipv4Addr::LOCALHOST,
+            mask: Ipv4Addr::new(255, 0, 0, 0),
+            gateway: None,
+            vlan: None,
+            routed: false,
+        };
+        let (tx, rx) = unbounded();
+        let target = Ipv4Addr::new(127, 0, 0, 2);
+        fallback_sweep(&n, vec![target], &tx, &AtomicBool::new(false));
+        assert!(rx
+            .try_iter()
+            .any(|m| matches!(m, Message::Probe(ip, _) if ip == target)));
+    }
+    #[test]
+    fn shared_proxy_arp_addresses_are_probed_without_claiming_gateway_mac() {
+        let mut n = net();
+        n.gateway = Some("192.168.31.1".parse().unwrap());
+        let mac = "00:11:22:33:44:55".to_string();
+        let replies = HashMap::from([(
+            mac.clone(),
+            HashSet::from([
+                "192.168.31.1".parse().unwrap(),
+                "192.168.31.2".parse().unwrap(),
+                "192.168.31.3".parse().unwrap(),
+            ]),
+        )]);
+        let (tx, rx) = unbounded();
+        publish_arp_replies(&n, replies, Some(&mac), &tx);
+        let mut probes = HashSet::new();
+        let mut gateways = 0;
+        while let Ok(message) = rx.try_recv() {
+            match message {
+                Message::Probe(ip, _) => {
+                    probes.insert(ip);
+                }
+                Message::Found(o) => {
+                    assert_eq!(o.ip, n.gateway.unwrap());
+                    assert_eq!(o.mac.as_deref(), Some(mac.as_str()));
+                    gateways += 1;
+                }
+                _ => panic!("unexpected observation"),
+            }
+        }
+        assert_eq!(gateways, 1);
+        let (single_tx, single_rx) = unbounded();
+        publish_arp_replies(
+            &n,
+            HashMap::from([(
+                mac.clone(),
+                HashSet::from(["192.168.31.9".parse().unwrap()]),
+            )]),
+            Some(&mac),
+            &single_tx,
+        );
+        assert!(matches!(single_rx.try_recv(), Ok(Message::Probe(_, _))));
+        assert_eq!(
+            probes,
+            HashSet::from([
+                "192.168.31.2".parse().unwrap(),
+                "192.168.31.3".parse().unwrap()
+            ])
+        );
+    }
+    #[test]
+    fn large_subnet_cycles_across_all_24_blocks() {
+        let mut n = net();
+        n.mask = "255.255.0.0".parse().unwrap();
+        let first = targets_chunk(&n, 0).0;
+        let next = targets_chunk(&n, 1).0;
+        let wrap = targets_chunk(&n, 256).0;
+        assert_eq!(first[0], "192.168.31.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(next[0], "192.168.32.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(first, wrap);
     }
     #[test]
     fn dhcp_router_must_be_on_the_interface_subnet() {
@@ -1285,14 +1561,14 @@ mod tests {
     #[test]
     fn range_and_large_limit() {
         let mut n = net();
-        assert_eq!(targets(&n).0.len(), 254);
+        assert_eq!(targets_chunk(&n, 0).0.len(), 254);
         n.mask = "255.0.0.0".parse().unwrap();
-        assert!(targets(&n).1);
-        assert_eq!(targets(&n).0.len(), 254);
+        assert!(targets_chunk(&n, 0).1);
+        assert_eq!(targets_chunk(&n, 0).0.len(), 254);
     }
     #[test]
     fn parses_mac_and_skips_incomplete() {
-        let v=parse_neighbors("foo.local (192.168.31.7) at a:b:0:12:34:ef on en0\n? (192.168.31.8) at (incomplete) on en0\n? (192.168.31.255) at ff:ff:ff:ff:ff:ff on en0");
+        let v=parse_neighbors("foo.local (192.168.31.7) at a:b:0:12:34:ef on en0\n? (192.168.31.8) at (incomplete) on en0\n? (192.168.31.255) at ff:ff:ff:ff:ff:ff on en0\n? (192.168.31.9) at 02:00:00:00:00:00 on en0");
         assert_eq!(v.len(), 1);
         assert_eq!(v[0].1, "0A:0B:00:12:34:EF");
         assert_eq!(v[0].2.as_deref(), Some("foo.local"));

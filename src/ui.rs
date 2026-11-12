@@ -38,9 +38,9 @@ struct App {
     modal: bool,
 }
 impl App {
-    fn new(demo: bool) -> Self {
+    fn new(demo: bool, extra_subnets: Vec<String>) -> Self {
         Self {
-            scanner: (!demo).then(Scanner::start),
+            scanner: (!demo).then(|| Scanner::start(extra_subnets)),
             snap: if demo {
                 demo_snapshot()
             } else {
@@ -209,7 +209,13 @@ impl App {
                 .unwrap_or_default();
             lines.push((
                 Line::styled(
-                    format!(" ◉ {}  {}{}", net.interface, net.cidr(), vlan),
+                    format!(
+                        " ◉ {}  {}{}{}",
+                        net.interface,
+                        net.cidr(),
+                        vlan,
+                        if net.routed { " · routed" } else { "" }
+                    ),
                     Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
                 ),
                 None,
@@ -217,7 +223,15 @@ impl App {
             let list: Vec<_> = self
                 .devices()
                 .into_iter()
-                .filter(|d| d.interface == net.interface && net.contains(d.ip))
+                .filter(|d| {
+                    d.interface == net.interface
+                        && net.contains(d.ip)
+                        && !self.snap.networks.iter().any(|other| {
+                            other.interface == net.interface
+                                && other.contains(d.ip)
+                                && other.prefix() > net.prefix()
+                        })
+                })
                 .collect();
             if list.is_empty() {
                 lines.push((
@@ -356,7 +370,7 @@ impl App {
         ];
         let mut row = |label: &str, value: String| {
             lines.push(Line::from(vec![
-                Span::styled(format!(" {label:<13}"), Style::default().fg(MUTED)),
+                Span::styled(format!(" {label:<13} "), Style::default().fg(MUTED)),
                 Span::raw(value),
             ]));
         };
@@ -555,7 +569,7 @@ fn centered(r: Rect, px: u16, py: u16) -> Rect {
         ])
         .split(v[1])[1]
 }
-pub fn run(demo: bool) -> io::Result<()> {
+pub fn run(demo: bool, extra_subnets: Vec<String>) -> io::Result<()> {
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     if let Err(e) = execute!(stdout, EnterAlternateScreen, EnableMouseCapture) {
@@ -570,7 +584,7 @@ pub fn run(demo: bool) -> io::Result<()> {
             return Err(e);
         }
     };
-    let result = run_loop(&mut terminal, App::new(demo));
+    let result = run_loop(&mut terminal, App::new(demo, extra_subnets));
     let _ = disable_raw_mode();
     let _ = execute!(
         terminal.backend_mut(),
@@ -664,6 +678,7 @@ fn demo_snapshot() -> Snapshot {
             mask: "255.255.255.0".parse().unwrap(),
             gateway: Some(addr(1)),
             vlan: None,
+            routed: false,
         }],
         status: "Demo · simulated devices".into(),
         warnings: vec![],
@@ -677,7 +692,7 @@ mod tests {
 
     #[test]
     fn scan_failures_are_shown_as_diagnostics_not_service_results() {
-        let mut app = App::new(true);
+        let mut app = App::new(true, vec![]);
         let device = &mut app.snap.devices[0];
         device.scan_status = Some("Partial · some nmap checks failed".into());
         device.scan_warnings = vec!["rpcinfo (22/tcp)".into()];
