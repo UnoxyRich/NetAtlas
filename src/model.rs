@@ -420,6 +420,11 @@ impl DeviceStore {
             (device.kind, device.kind_reason) = classify(device);
         }
     }
+    pub fn active_device(&self, ip: Ipv4Addr, interface: &str) -> Option<&Device> {
+        self.devices
+            .values()
+            .find(|d| !d.displaced && d.ip == ip && d.interface == interface)
+    }
     pub fn active_mac(&self, ip: Ipv4Addr, interface: &str) -> Option<String> {
         self.devices
             .values()

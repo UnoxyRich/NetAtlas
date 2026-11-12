@@ -1,5 +1,6 @@
 use crate::{
     discovery::{Network, Scanner, Snapshot},
+    filter::{matches_search, DeviceFilter},
     model::{Device, DeviceKind, DeviceStore, Observation},
 };
 use crossterm::{
@@ -36,6 +37,17 @@ struct App {
     rows: Vec<(u16, u64)>,
     nerd: bool,
     modal: bool,
+    filter: DeviceFilter,
+    search: String,
+    edit: Option<EditMode>,
+    draft: String,
+    edit_original: String,
+    input_error: Option<String>,
+}
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum EditMode {
+    Search,
+    Filter,
 }
 impl App {
     fn new(demo: bool, extra_subnets: Vec<String>) -> Self {
@@ -53,6 +65,12 @@ impl App {
             rows: vec![],
             nerd: false,
             modal: false,
+            filter: DeviceFilter::default(),
+            search: String::new(),
+            edit: None,
+            draft: String::new(),
+            edit_original: String::new(),
+            input_error: None,
         }
     }
     fn devices(&self) -> Vec<&Device> {
@@ -65,6 +83,8 @@ impl App {
                     .networks
                     .iter()
                     .any(|n| n.interface == d.interface && n.contains(d.ip))
+                    && self.filter.matches(d)
+                    && matches_search(d, &self.search)
             })
             .collect();
         devices.sort_by(|a, b| {
@@ -82,6 +102,66 @@ impl App {
                 .then(a.ip.cmp(&b.ip))
         });
         devices
+    }
+    fn begin_edit(&mut self, mode: EditMode) {
+        self.edit = Some(mode);
+        self.draft = match mode {
+            EditMode::Search => self.search.clone(),
+            EditMode::Filter => self.filter.expression.clone(),
+        };
+        self.edit_original = self.draft.clone();
+        self.input_error = None;
+    }
+    fn edit_key(&mut self, code: KeyCode) {
+        let Some(mode) = self.edit else {
+            return;
+        };
+        match code {
+            KeyCode::Esc => {
+                if mode == EditMode::Search {
+                    self.search = self.edit_original.clone();
+                }
+                self.edit = None;
+                self.input_error = None;
+            }
+            KeyCode::Enter => {
+                if mode == EditMode::Filter {
+                    match DeviceFilter::parse(&self.draft) {
+                        Ok(filter) => {
+                            if let Some(scanner) = &self.scanner {
+                                scanner.set_filter(filter.clone());
+                            }
+                            self.filter = filter;
+                            self.edit = None;
+                            self.input_error = None;
+                        }
+                        Err(error) => self.input_error = Some(error),
+                    }
+                } else {
+                    self.edit = None;
+                }
+            }
+            KeyCode::Backspace => {
+                self.draft.pop();
+                self.input_error = None;
+            }
+            KeyCode::Char(c) if !c.is_control() && self.draft.chars().count() < 200 => {
+                self.draft.push(c);
+                self.input_error = None;
+            }
+            _ => (),
+        }
+        if self.edit == Some(EditMode::Search) {
+            self.search = self.draft.clone();
+        }
+    }
+    fn clear_filters(&mut self) {
+        self.filter = DeviceFilter::default();
+        self.search.clear();
+        self.input_error = None;
+        if let Some(scanner) = &self.scanner {
+            scanner.set_filter(self.filter.clone());
+        }
     }
     fn navigate(&mut self, delta: isize) {
         let ids: Vec<_> = self.devices().iter().map(|d| d.id).collect();
@@ -127,26 +207,85 @@ impl App {
             ),
             area,
         );
-        if area.width < 45 || area.height < 8 {
-            f.render_widget(Paragraph::new("Resize terminal to at least 45 × 8"), area);
+        if area.width < 45 || area.height < 12 {
+            f.render_widget(Paragraph::new("Resize terminal to at least 45 × 12"), area);
             return;
         }
         let v = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
+                Constraint::Length(6),
                 Constraint::Min(3),
                 Constraint::Length(2),
             ])
             .split(area);
-        let header = Line::from(vec![
-            Span::styled(
-                " NETATLAS ",
-                Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+        let visible = self.devices();
+        let shown = visible.len();
+        let total = self.snap.devices.len();
+        let online = visible.iter().filter(|d| d.online()).count();
+        let scanned = visible
+            .iter()
+            .filter(|d| d.ports_scanned_at.is_some())
+            .count();
+        let with_open = visible.iter().filter(|d| !d.ports.is_empty()).count();
+        let search = if self.search.is_empty() {
+            "all"
+        } else {
+            &self.search
+        };
+        let filter = if self.filter.is_empty() {
+            "all"
+        } else {
+            &self.filter.expression
+        };
+        let input = match self.edit {
+            Some(EditMode::Search) => format!(" Search: {}_   Filter: {}", self.draft, filter),
+            Some(EditMode::Filter) => format!(" Search: {}   Filter: {}_", search, self.draft),
+            None => format!(" Search: {}   Filter: {}", search, filter),
+        };
+        let sweep = self
+            .snap
+            .sweep
+            .as_ref()
+            .map(|p| {
+                let total = p.total.max(1);
+                let filled = (p.sent.min(p.total) * 12) / total;
+                format!(
+                    " Sweep {}  [{}{}] {}/{} scheduled",
+                    p.scope,
+                    "█".repeat(filled),
+                    "░".repeat(12 - filled),
+                    p.sent,
+                    p.total
+                )
+            })
+            .unwrap_or_else(|| format!(" Sweep: {}", self.snap.status));
+        let m = &self.snap.metrics;
+        let stats = format!(" Devices {shown}/{total} · online {online} · scanned {scanned} · open {with_open} | scans {} active / {} queued", m.running, m.queued);
+        let details = format!(" Targeted {} active / {} queued / {} done / {} failed · probes {}/{} active/queued · names {}/{}", m.filter_running, m.filter_queued, m.filter_completed, m.filter_failures, m.probes_running, m.probes_queued, m.names_running, m.names_queued);
+        let header = vec![
+            Line::from(vec![
+                Span::styled(
+                    " NETATLAS ",
+                    Style::default().fg(GREEN).add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("  {}", self.snap.status),
+                    Style::default().fg(MUTED),
+                ),
+            ]),
+            Line::styled(
+                input,
+                Style::default().fg(if self.edit.is_some() {
+                    GREEN
+                } else {
+                    Color::White
+                }),
             ),
-            Span::raw("  "),
-            Span::styled(&self.snap.status, Style::default().fg(MUTED)),
-        ]);
+            Line::styled(sweep, Style::default().fg(GREEN)),
+            Line::styled(stats, Style::default().fg(MUTED)),
+            Line::styled(details, Style::default().fg(MUTED)),
+        ];
         f.render_widget(
             Paragraph::new(header).block(
                 Block::default()
@@ -173,17 +312,25 @@ impl App {
             f.render_widget(Clear, p);
             self.render_details(f, p);
         }
-        let footer = if wide {
-            " ↑↓ select   click device   PgUp/PgDn details   i icons   q quit "
+        let footer = if self.edit.is_some() {
+            " Enter apply   Esc cancel   Backspace delete "
+        } else if wide {
+            " / search   f filter   c clear   ↑↓ select   click device   PgUp/PgDn details   i icons   q quit "
         } else {
-            " ↑↓ select   Enter details   PgUp/PgDn scroll   i icons   q quit "
+            " / search  f filter  c clear  ↑↓ select  Enter details  i icons  q quit "
         };
         let warning = self
-            .snap
-            .warnings
-            .first()
+            .input_error
+            .as_ref()
+            .or_else(|| self.snap.warnings.first())
             .map(|s| format!("  ⚠ {s}"))
-            .unwrap_or_default();
+            .unwrap_or_else(|| {
+                if self.edit == Some(EditMode::Filter) {
+                    "  Examples: type:printer port:631 service:http open online".into()
+                } else {
+                    "  Scanning continuously".into()
+                }
+            });
         f.render_widget(
             Paragraph::new(vec![
                 Line::styled(warning, Style::default().fg(AMBER)),
@@ -235,7 +382,14 @@ impl App {
                 .collect();
             if list.is_empty() {
                 lines.push((
-                    Line::styled("   └─ waiting for devices", Style::default().fg(MUTED)),
+                    Line::styled(
+                        if self.filter.is_empty() && self.search.is_empty() {
+                            "   └─ No devices discovered yet"
+                        } else {
+                            "   └─ No matching devices · scans continue"
+                        },
+                        Style::default().fg(MUTED),
+                    ),
                     None,
                 ));
             }
@@ -285,7 +439,7 @@ impl App {
         }
         if self.snap.networks.is_empty() {
             lines.push((
-                Line::styled(" Waiting for a local network…", Style::default().fg(MUTED)),
+                Line::styled(" Finding an active network…", Style::default().fg(MUTED)),
                 None,
             ));
         }
@@ -440,7 +594,12 @@ impl App {
                     t.elapsed().as_secs()
                 )
             })
-            .unwrap_or_else(|| " Open TCP ports · waiting for scan".into());
+            .unwrap_or_else(|| {
+                format!(
+                    " Open TCP ports · {}",
+                    d.scan_status.as_deref().unwrap_or("scan not started")
+                )
+            });
         lines.push(Line::styled(
             port_title,
             Style::default().fg(MUTED).add_modifier(Modifier::BOLD),
@@ -609,8 +768,14 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App)
         }
         redraw = true;
         match event::read()? {
+            Event::Key(k) if k.kind == KeyEventKind::Press && app.edit.is_some() => {
+                app.edit_key(k.code)
+            }
             Event::Key(k) if k.kind == KeyEventKind::Press => match k.code {
                 KeyCode::Char('q') => break,
+                KeyCode::Char('/') => app.begin_edit(EditMode::Search),
+                KeyCode::Char('f') => app.begin_edit(EditMode::Filter),
+                KeyCode::Char('c') => app.clear_filters(),
                 KeyCode::Esc => app.modal = false,
                 KeyCode::Down | KeyCode::Char('j') => app.navigate(1),
                 KeyCode::Up | KeyCode::Char('k') => app.navigate(-1),
@@ -620,7 +785,7 @@ fn run_loop(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, mut app: App)
                 KeyCode::PageUp => app.details_offset = app.details_offset.saturating_sub(5),
                 _ => {}
             },
-            Event::Mouse(m) => match m.kind {
+            Event::Mouse(m) if app.edit.is_none() => match m.kind {
                 MouseEventKind::Down(MouseButton::Left) => {
                     if !app.modal && m.column < app.map_right {
                         if let Some((_, id)) = app.rows.iter().find(|(y, _)| *y == m.row) {
@@ -682,6 +847,8 @@ fn demo_snapshot() -> Snapshot {
         }],
         status: "Demo · simulated devices".into(),
         warnings: vec![],
+        sweep: None,
+        metrics: Default::default(),
     }
 }
 
@@ -690,6 +857,62 @@ mod tests {
     use super::*;
     use ratatui::backend::TestBackend;
 
+    #[test]
+    fn search_and_filter_editing_updates_results_and_can_be_cancelled() {
+        let mut app = App::new(true, vec![]);
+        app.begin_edit(EditMode::Search);
+        for c in "printer".chars() {
+            app.edit_key(KeyCode::Char(c));
+        }
+        assert_eq!(app.devices().len(), 1);
+        app.edit_key(KeyCode::Enter);
+        app.begin_edit(EditMode::Search);
+        app.edit_key(KeyCode::Char('x'));
+        assert!(app.devices().is_empty());
+        app.edit_key(KeyCode::Esc);
+        assert_eq!(app.devices().len(), 1);
+        app.clear_filters();
+        app.begin_edit(EditMode::Filter);
+        for c in "type:printer".chars() {
+            app.edit_key(KeyCode::Char(c));
+        }
+        app.edit_key(KeyCode::Enter);
+        assert_eq!(app.devices().len(), 1);
+        app.begin_edit(EditMode::Filter);
+        app.draft = "port:not-a-number".into();
+        app.edit_key(KeyCode::Enter);
+        assert!(app.input_error.is_some());
+        assert_eq!(app.filter.expression, "type:printer");
+        app.edit_key(KeyCode::Esc);
+        app.clear_filters();
+        assert_eq!(app.devices().len(), 7);
+    }
+    #[test]
+    fn status_bar_shows_real_sweep_and_scan_counts() {
+        let mut app = App::new(true, vec![]);
+        app.snap.sweep = Some(crate::discovery::SweepProgress {
+            scope: "192.168.1.0/24".into(),
+            sent: 128,
+            total: 256,
+        });
+        app.snap.metrics.running = 3;
+        app.snap.metrics.queued = 4;
+        app.snap.metrics.filter_completed = 5;
+        let mut terminal = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        terminal.draw(|frame| app.render(frame)).unwrap();
+        let text: String = terminal
+            .backend()
+            .buffer()
+            .content()
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect();
+        assert!(text.contains("192.168.1.0/24"));
+        assert!(text.contains("128/256"));
+        assert!(text.contains("scans 3 active / 4 queued"));
+        assert!(text.contains("5 done"));
+        assert!(!text.to_lowercase().contains("waiting"));
+    }
     #[test]
     fn scan_failures_are_shown_as_diagnostics_not_service_results() {
         let mut app = App::new(true, vec![]);

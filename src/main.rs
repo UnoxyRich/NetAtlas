@@ -1,4 +1,5 @@
 mod discovery;
+mod filter;
 mod fingerprint;
 mod model;
 mod netbios;
@@ -11,7 +12,7 @@ use std::io;
 fn main() -> io::Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.iter().any(|a| a == "--help" || a == "-h") {
-        println!("NetAtlas — live local network map\n\nUsage: netatlas [--demo] [--subnet PRIVATE_CIDR]...\n\nRun with sudo for direct ARP discovery. nmap is optional.\nKeys: ↑/↓ select · Enter details · i icons · q quit");
+        println!("NetAtlas — live local network map\n\nUsage: netatlas [--demo] [--subnet PRIVATE_CIDR]...\n\nRun with sudo for direct ARP discovery. nmap is optional.\nKeys: / search · f filter · c clear · ↑/↓ select · Enter details · i icons · q quit");
         return Ok(());
     }
     let mut extra_subnets = Vec::new();

@@ -1,4 +1,7 @@
-use crate::model::{Device, DeviceStore, Observation};
+use crate::{
+    filter::DeviceFilter,
+    model::{Device, DeviceStore, Observation},
+};
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
 use if_addrs::{get_if_addrs, IfAddr};
 use mdns_sd::{ServiceDaemon, ServiceEvent};
@@ -11,13 +14,13 @@ use pnet_packet::{
     MutablePacket, Packet,
 };
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     io::Read,
     net::{Ipv4Addr, SocketAddr, TcpStream, UdpSocket},
     process::{Command, Stdio},
     sync::{
-        atomic::{AtomicBool, Ordering},
-        Arc,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+        Arc, RwLock,
     },
     thread,
     time::{Duration, Instant},
@@ -94,6 +97,27 @@ pub struct Snapshot {
     pub networks: Vec<Network>,
     pub status: String,
     pub warnings: Vec<String>,
+    pub sweep: Option<SweepProgress>,
+    pub metrics: ScanMetrics,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct SweepProgress {
+    pub scope: String,
+    pub sent: usize,
+    pub total: usize,
+}
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ScanMetrics {
+    pub running: usize,
+    pub queued: usize,
+    pub filter_running: usize,
+    pub filter_queued: usize,
+    pub probes_running: usize,
+    pub probes_queued: usize,
+    pub names_running: usize,
+    pub names_queued: usize,
+    pub filter_completed: usize,
+    pub filter_failures: usize,
 }
 impl Default for Snapshot {
     fn default() -> Self {
@@ -102,37 +126,48 @@ impl Default for Snapshot {
             networks: vec![],
             status: "Finding interfaces…".into(),
             warnings: vec![],
+            sweep: None,
+            metrics: ScanMetrics::default(),
         }
     }
 }
 pub(crate) enum Message {
     Found(Observation),
     Probe(Ipv4Addr, String),
+    ProbeDone(Ipv4Addr, String),
     Enriched(Observation),
     ServiceGone(Ipv4Addr, String, String),
     ScanStatus(Ipv4Addr, String, Option<String>, String),
     ScanDone(Ipv4Addr, String, Option<String>),
     Status(String),
+    Sweep(SweepProgress),
+    FilterDone(FilterJob, bool),
     Warning(String),
     Networks(Vec<Network>),
     SubnetWarnings(Vec<String>),
 }
 pub struct Scanner {
     pub updates: Receiver<Snapshot>,
+    filters: Sender<DeviceFilter>,
     stop: Arc<AtomicBool>,
     worker: Option<thread::JoinHandle<()>>,
 }
 impl Scanner {
     pub fn start(extra_subnets: Vec<String>) -> Self {
         let (out, updates) = bounded(1);
+        let (filters, filter_rx) = unbounded();
         let stop = Arc::new(AtomicBool::new(false));
         let s = stop.clone();
-        let worker = thread::spawn(move || controller(out, s, extra_subnets));
+        let worker = thread::spawn(move || controller(out, s, extra_subnets, filter_rx));
         Self {
             updates,
+            filters,
             stop,
             worker: Some(worker),
         }
+    }
+    pub fn set_filter(&self, filter: DeviceFilter) {
+        let _ = self.filters.send(filter);
     }
 }
 impl Drop for Scanner {
@@ -143,13 +178,21 @@ impl Drop for Scanner {
         }
     }
 }
-fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: Vec<String>) {
+fn controller(
+    updates: Sender<Snapshot>,
+    stop: Arc<AtomicBool>,
+    extra_subnets: Vec<String>,
+    filters: Receiver<DeviceFilter>,
+) {
     let (tx, rx) = unbounded();
     type Job = (Ipv4Addr, String, Option<String>);
     let (jobs, jobs_rx) = bounded::<Job>(4096);
     let (deep_jobs, deep_rx) = bounded::<Job>(4096);
     let (ping_jobs, ping_rx) = bounded::<Job>(4096);
     let (name_jobs, name_rx) = bounded::<Job>(4096);
+    let (filter_jobs, filter_rx) = bounded::<FilterJob>(4096);
+    let active_filter_ports = Arc::new(RwLock::new(Vec::<u16>::new()));
+    let names_running = Arc::new(AtomicUsize::new(0));
     let nmap_version = Command::new("nmap")
         .arg("--version")
         .stderr(Stdio::null())
@@ -177,8 +220,24 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: V
         workers.push(thread::spawn(move || deep_worker(rx, tx, stop, privileged)));
     }
     for _ in 0..32 {
-        let (tx, stop, rx) = (tx.clone(), stop.clone(), name_rx.clone());
-        workers.push(thread::spawn(move || name_worker(rx, tx, stop)));
+        let (tx, stop, rx, running) = (
+            tx.clone(),
+            stop.clone(),
+            name_rx.clone(),
+            names_running.clone(),
+        );
+        workers.push(thread::spawn(move || name_worker(rx, tx, stop, running)));
+    }
+    for _ in 0..8 {
+        let (tx, stop, rx, active) = (
+            tx.clone(),
+            stop.clone(),
+            filter_rx.clone(),
+            active_filter_ports.clone(),
+        );
+        workers.push(thread::spawn(move || {
+            filter_worker(rx, tx, stop, has_nmap, active)
+        }));
     }
     for _ in 0..128 {
         let (tx, stop, rx) = (tx.clone(), stop.clone(), ping_rx.clone());
@@ -217,20 +276,83 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: V
             .push("OS fingerprinting requires elevated privileges".into());
     }
     let mut pinged = HashMap::<(Ipv4Addr, String), Instant>::new();
+    let mut probe_pending = VecDeque::<(Ipv4Addr, String)>::new();
+    let mut probe_pending_set = HashSet::<(Ipv4Addr, String)>::new();
+    let mut probe_inflight = HashSet::<(Ipv4Addr, String)>::new();
     let mut active_macs = HashMap::<(Ipv4Addr, String), String>::new();
+    let mut filter_scheduler = FilterScheduler::new(filter_jobs.clone());
+    let mut next_filter_refresh = Instant::now();
+    let mut next_metrics = Instant::now();
     let mut dirty = true;
     while !stop.load(Ordering::Relaxed) {
+        while let Ok(filter) = filters.try_recv() {
+            if let Ok(mut active) = active_filter_ports.write() {
+                *active = filter.targeted_ports();
+            }
+            filter_scheduler.set_filter(filter);
+            // Revisit existing matches immediately; discovery remains independent of the filter.
+            for d in store.snapshot() {
+                if !filter_scheduler.filter.is_empty() && filter_scheduler.filter.matches(&d) {
+                    let key = (d.ip, d.interface.clone());
+                    scheduled.remove(&key);
+                    let job = (d.ip, d.interface.clone(), d.mac.clone());
+                    if !inflight.contains(&key) && jobs.try_send(job.clone()).is_ok() {
+                        inflight.insert(key);
+                        let _ = name_jobs.try_send(job.clone());
+                        if has_nmap {
+                            store.set_scan_status_for(
+                                job.0,
+                                &job.1,
+                                job.2.as_deref(),
+                                "Queued".into(),
+                            );
+                        }
+                    }
+                }
+                if has_nmap {
+                    filter_scheduler.schedule(&d);
+                }
+            }
+            next_filter_refresh = Instant::now();
+            dirty = true;
+        }
+        if has_nmap && Instant::now() >= next_filter_refresh {
+            for d in store.snapshot() {
+                filter_scheduler.schedule(&d);
+                let key = (d.ip, d.interface.clone());
+                if filter_rescan_due(
+                    &filter_scheduler.filter,
+                    &d,
+                    scheduled.get(&key),
+                    inflight.contains(&key),
+                ) {
+                    let job = (d.ip, d.interface.clone(), d.mac.clone());
+                    if jobs.try_send(job.clone()).is_ok() {
+                        inflight.insert(key);
+                        let _ = name_jobs.try_send(job.clone());
+                        store.set_scan_status_for(job.0, &job.1, job.2.as_deref(), "Queued".into());
+                    }
+                }
+            }
+            next_filter_refresh = Instant::now() + Duration::from_secs(5);
+        }
         if let Ok(message) = rx.recv_timeout(Duration::from_millis(1)) {
             match message {
                 Message::Probe(ip, iface) => {
-                    let key = (ip, iface.clone());
+                    let key = (ip, iface);
                     if pinged
                         .get(&key)
                         .is_none_or(|t| t.elapsed() > Duration::from_secs(30))
-                        && ping_jobs.try_send((ip, iface, None)).is_ok()
+                        && !probe_inflight.contains(&key)
+                        && probe_pending_set.insert(key.clone())
                     {
-                        pinged.insert(key, Instant::now());
+                        probe_pending.push_back(key);
                     }
+                }
+                Message::ProbeDone(ip, iface) => {
+                    let key = (ip, iface);
+                    probe_inflight.remove(&key);
+                    pinged.insert(key, Instant::now());
                 }
                 Message::Found(o) => {
                     let key = (o.ip, o.interface.clone());
@@ -238,6 +360,11 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: V
                     let previous = active_macs.get(&key).cloned();
                     store.observe(o);
                     let current = store.active_mac(key.0, &key.1);
+                    if has_nmap {
+                        if let Some(d) = store.active_device(key.0, &key.1) {
+                            filter_scheduler.schedule(d);
+                        }
+                    }
                     if identity_changed(previous.as_deref(), current.as_deref()) {
                         scheduled.remove(&key);
                     }
@@ -255,8 +382,11 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: V
                             .get(&key)
                             .is_none_or(|t| t.elapsed() > Duration::from_secs(10));
                     let job = (key.0, key.1.clone(), current);
-                    if queue_ping && ping_jobs.try_send(job.clone()).is_ok() {
-                        pinged.insert(key.clone(), Instant::now());
+                    if queue_ping
+                        && !probe_inflight.contains(&key)
+                        && probe_pending_set.insert(key.clone())
+                    {
+                        probe_pending.push_back(key.clone());
                     }
                     if queue_scan && jobs.try_send(job.clone()).is_ok() {
                         inflight.insert(key.clone());
@@ -287,6 +417,9 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: V
                     }
                 }
                 Message::Networks(n) => {
+                    if n.is_empty() {
+                        snap.sweep = None;
+                    }
                     snap.networks = n;
                 }
                 Message::SubnetWarnings(warnings) => {
@@ -294,6 +427,8 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: V
                     snap.warnings.extend(warnings);
                 }
                 Message::Status(s) => snap.status = s,
+                Message::Sweep(progress) => snap.sweep = Some(progress),
+                Message::FilterDone(job, success) => filter_scheduler.complete(job, success),
                 Message::Warning(w) => {
                     if !snap.warnings.contains(&w) {
                         snap.warnings.push(w);
@@ -302,12 +437,180 @@ fn controller(updates: Sender<Snapshot>, stop: Arc<AtomicBool>, extra_subnets: V
             }
             dirty = true;
         }
+        for _ in 0..256 {
+            if ping_jobs.is_full() {
+                break;
+            }
+            let Some(key) = probe_pending.pop_front() else {
+                break;
+            };
+            probe_pending_set.remove(&key);
+            if !snap
+                .networks
+                .iter()
+                .any(|network| network.interface == key.1 && network.contains(key.0))
+            {
+                continue;
+            }
+            if probe_inflight.contains(&key) {
+                continue;
+            }
+            if ping_jobs.try_send((key.0, key.1.clone(), None)).is_ok() {
+                probe_inflight.insert(key);
+            }
+        }
+        if Instant::now() >= next_metrics {
+            let queued = jobs.len() + deep_jobs.len();
+            let metrics = ScanMetrics {
+                running: inflight.len().saturating_sub(queued),
+                queued,
+                filter_running: filter_scheduler
+                    .inflight
+                    .len()
+                    .saturating_sub(filter_jobs.len()),
+                filter_queued: filter_jobs.len(),
+                probes_running: probe_inflight.len().saturating_sub(ping_jobs.len()),
+                probes_queued: ping_jobs.len() + probe_pending.len(),
+                names_running: names_running.load(Ordering::Relaxed),
+                names_queued: name_jobs.len(),
+                filter_completed: filter_scheduler.completed,
+                filter_failures: filter_scheduler.failures,
+            };
+            if snap.metrics != metrics {
+                snap.metrics = metrics;
+                dirty = true;
+            }
+            next_metrics = Instant::now() + Duration::from_millis(250);
+        }
         if dirty && publish_snapshot(&store, &mut snap, &updates) {
             dirty = false;
         }
     }
     for worker in workers {
         let _ = worker.join();
+    }
+}
+fn filter_rescan_due(
+    filter: &DeviceFilter,
+    device: &Device,
+    previous: Option<&Instant>,
+    inflight: bool,
+) -> bool {
+    !filter.is_empty()
+        && filter.matches(device)
+        && !inflight
+        && previous.is_none_or(|time| time.elapsed() >= Duration::from_secs(120))
+}
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(crate) struct FilterJob {
+    ip: Ipv4Addr,
+    interface: String,
+    mac: Option<String>,
+    ports: Vec<u16>,
+}
+struct FilterScheduler {
+    filter: DeviceFilter,
+    jobs: Sender<FilterJob>,
+    inflight: HashSet<FilterJob>,
+    next: HashMap<FilterJob, Instant>,
+    completed: usize,
+    failures: usize,
+}
+impl FilterScheduler {
+    fn new(jobs: Sender<FilterJob>) -> Self {
+        Self {
+            filter: DeviceFilter::default(),
+            jobs,
+            inflight: HashSet::new(),
+            next: HashMap::new(),
+            completed: 0,
+            failures: 0,
+        }
+    }
+    fn set_filter(&mut self, filter: DeviceFilter) {
+        if self.filter != filter {
+            self.completed = 0;
+            self.failures = 0;
+            let ports = filter.targeted_ports();
+            self.next.retain(|job, _| job.ports == ports);
+            self.filter = filter;
+        }
+    }
+    fn schedule(&mut self, device: &Device) {
+        let ports = self.filter.targeted_ports();
+        if ports.is_empty() || !self.filter.candidate(device) {
+            return;
+        }
+        let job = FilterJob {
+            ip: device.ip,
+            interface: device.interface.clone(),
+            mac: device.mac.clone(),
+            ports,
+        };
+        if self.inflight.contains(&job)
+            || self
+                .next
+                .get(&job)
+                .is_some_and(|time| *time > Instant::now())
+        {
+            return;
+        }
+        if self.jobs.try_send(job.clone()).is_ok() {
+            self.inflight.insert(job);
+        }
+    }
+    fn complete(&mut self, job: FilterJob, success: bool) {
+        self.inflight.remove(&job);
+        if job.ports == self.filter.targeted_ports() {
+            if success {
+                self.completed += 1;
+            } else {
+                self.failures += 1;
+            }
+        }
+        self.next.insert(
+            job,
+            Instant::now() + Duration::from_secs(if success { 120 } else { 30 }),
+        );
+    }
+}
+fn filter_worker(
+    rx: Receiver<FilterJob>,
+    tx: Sender<Message>,
+    stop: Arc<AtomicBool>,
+    has_nmap: bool,
+    active: Arc<RwLock<Vec<u16>>>,
+) {
+    while !stop.load(Ordering::Relaxed) {
+        let Ok(job) = rx.recv_timeout(Duration::from_millis(100)) else {
+            continue;
+        };
+        if active.read().is_ok_and(|ports| *ports != job.ports) {
+            let _ = tx.send(Message::FilterDone(job, false));
+            continue;
+        }
+        let result = if has_nmap {
+            run_nmap_once(
+                std::ffi::OsStr::new("nmap"),
+                job.ip,
+                &stop,
+                ScanPhase::Quick,
+                false,
+                Some(&job.ports),
+            )
+        } else {
+            Err("nmap unavailable".into())
+        };
+        let success = match result {
+            Ok(mut observation) => {
+                observation.interface = job.interface.clone();
+                observation.mac = job.mac.clone();
+                let _ = tx.send(Message::Enriched(observation));
+                true
+            }
+            Err(_) => false,
+        };
+        let _ = tx.send(Message::FilterDone(job, success));
     }
 }
 fn publish_snapshot(
@@ -499,16 +802,23 @@ fn targets_chunk(n: &Network, cycle: u32) -> (Vec<Ipv4Addr>, bool) {
         let network_mask = u32::from(n.mask);
         let base = u32::from(n.address) & network_mask;
         let blocks = (1u64 << (24 - n.prefix())) as u32;
-        let local = (first - base) >> 8;
+        let local = if n.routed { 1 } else { (first - base) >> 8 };
         first = base + ((local + cycle % blocks) % blocks) * 256;
     }
     let last = first | !mask;
-    let (first, last) = if p >= 31 {
-        (first, last)
+    let actual_first = u32::from(n.address) & u32::from(n.mask);
+    let actual_last = actual_first | !u32::from(n.mask);
+    let start = if n.prefix() < 31 && first == actual_first {
+        first + 1
     } else {
-        (first + 1, last - 1)
+        first
     };
-    ((first..=last).map(Ipv4Addr::from).collect(), limited)
+    let end = if n.prefix() < 31 && last == actual_last {
+        last - 1
+    } else {
+        last
+    };
+    ((start..=end).map(Ipv4Addr::from).collect(), limited)
 }
 fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>, extra_subnets: Vec<String>) {
     let mut cycles = HashMap::<(String, String), u32>::new();
@@ -536,68 +846,119 @@ fn discovery_loop(tx: Sender<Message>, stop: Arc<AtomicBool>, extra_subnets: Vec
             continue;
         }
         for n in &nets {
-            if stop.load(Ordering::Relaxed) {
-                break;
-            }
-            let cycle = cycles.entry((n.interface.clone(), n.cidr())).or_default();
-            let (hosts, limited) = targets_chunk(n, *cycle);
-            *cycle = cycle.wrapping_add(1);
-            if limited {
-                let _ = tx.send(Message::Warning(format!(
-                    "{}: rotating through large subnet in /24 blocks",
-                    n.interface
-                )));
-            }
-            if n.routed {
+            let batches = if n.routed && n.prefix() < 20 { 8 } else { 1 };
+            for _ in 0..batches {
+                if stop.load(Ordering::Relaxed) {
+                    break;
+                }
+                let cycle = cycles.entry((n.interface.clone(), n.cidr())).or_default();
+                let (mut hosts, limited) = targets_chunk(n, *cycle);
+                *cycle = cycle.wrapping_add(1);
+                if limited {
+                    let _ = tx.send(Message::Warning(format!(
+                        "{}: rotating through large subnet in /24 blocks",
+                        n.interface
+                    )));
+                }
+                if n.routed {
+                    if n.prefix() < 20 {
+                        hosts = reachable_routed_chunk(
+                            &n.interface,
+                            hosts,
+                            crate::routes::route_interface,
+                        );
+                    }
+                    hosts.retain(|ip| {
+                        !nets.iter().any(|other| {
+                            other.interface == n.interface
+                                && other.prefix() > n.prefix()
+                                && other.contains(*ip)
+                        })
+                    });
+                    if hosts.is_empty() {
+                        continue;
+                    }
+                    let scope = if limited {
+                        let o = hosts[0].octets();
+                        format!("{}.{}.{}.0/24", o[0], o[1], o[2])
+                    } else {
+                        n.cidr()
+                    };
+                    let _ = tx.send(Message::Status(format!(
+                        "Scanning routed {scope} · up to {RATE} IP/s"
+                    )));
+                    let total = hosts.len();
+                    report_sweep(&tx, &scope, 0, total);
+                    for (index, ip) in hosts.into_iter().enumerate() {
+                        if stop.load(Ordering::Relaxed) {
+                            break;
+                        }
+                        let _ = tx.send(Message::Probe(ip, n.interface.clone()));
+                        if (index + 1) % 32 == 0 || index + 1 == total {
+                            report_sweep(&tx, &scope, index + 1, total);
+                        }
+                        thread::sleep(Duration::from_millis(1000 / RATE));
+                    }
+                    continue;
+                }
+                let mut me = Observation::new(n.address, &n.interface);
+                me.local = true;
+                me.gateway = n.gateway == Some(n.address);
+                me.mac = datalink::interfaces()
+                    .iter()
+                    .find(|i| i.name == n.interface)
+                    .and_then(interface_mac)
+                    .map(|m| m.to_string().to_uppercase());
+                let _ = tx.send(Message::Found(me));
                 let _ = tx.send(Message::Status(format!(
-                    "Scanning routed {} · {} targets · up to {} IP/s",
-                    n.cidr(),
+                    "Scanning {} · {} targets · up to {} IP/s",
+                    n.interface,
                     hosts.len(),
                     RATE
                 )));
-                for ip in hosts {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
+                let iface = datalink::interfaces()
+                    .into_iter()
+                    .find(|i| i.name == n.interface)
+                    .map(|mut i| {
+                        i.mac = interface_mac(&i);
+                        i
+                    });
+                let raw_ok = match iface.and_then(|i| open_channel(&i).map(|c| (i, c))) {
+                    Some((iface, (sender, receiver))) => {
+                        arp_sweep(n, &iface, &hosts, sender, receiver, &tx, &stop)
                     }
-                    let _ = tx.send(Message::Probe(ip, n.interface.clone()));
-                    thread::sleep(Duration::from_millis(1000 / RATE));
+                    None => false,
+                };
+                if !raw_ok && !stop.load(Ordering::Relaxed) {
+                    let _=tx.send(Message::Warning("ARP unavailable: using ICMP, TCP and neighbor cache; run with sudo for live ARP".into()));
+                    fallback_sweep(n, hosts, &tx, &stop);
                 }
-                continue;
-            }
-            let mut me = Observation::new(n.address, &n.interface);
-            me.local = true;
-            me.gateway = n.gateway == Some(n.address);
-            me.mac = datalink::interfaces()
-                .iter()
-                .find(|i| i.name == n.interface)
-                .and_then(interface_mac)
-                .map(|m| m.to_string().to_uppercase());
-            let _ = tx.send(Message::Found(me));
-            let _ = tx.send(Message::Status(format!(
-                "Scanning {} · {} targets · up to {} IP/s",
-                n.interface,
-                hosts.len(),
-                RATE
-            )));
-            let iface = datalink::interfaces()
-                .into_iter()
-                .find(|i| i.name == n.interface)
-                .map(|mut i| {
-                    i.mac = interface_mac(&i);
-                    i
-                });
-            let raw_ok = match iface.and_then(|i| open_channel(&i).map(|c| (i, c))) {
-                Some((iface, (sender, receiver))) => {
-                    arp_sweep(n, &iface, &hosts, sender, receiver, &tx, &stop)
-                }
-                None => false,
-            };
-            if !raw_ok && !stop.load(Ordering::Relaxed) {
-                let _=tx.send(Message::Warning("ARP unavailable: using ICMP, TCP and neighbor cache; run with sudo for live ARP".into()));
-                fallback_sweep(n, hosts, &tx, &stop);
             }
         }
     }
+}
+fn reachable_routed_chunk<F>(interface: &str, mut hosts: Vec<Ipv4Addr>, route: F) -> Vec<Ipv4Addr>
+where
+    F: Fn(Ipv4Addr) -> Option<String>,
+{
+    let sample = hosts
+        .iter()
+        .find(|ip| ip.octets()[3] == 1)
+        .or_else(|| hosts.first());
+    if sample.is_none_or(|ip| route(*ip).as_deref() != Some(interface)) {
+        return Vec::new();
+    }
+    hosts.retain(|ip| {
+        ![0, 255].contains(&ip.octets()[3]) || route(*ip).as_deref() == Some(interface)
+    });
+    hosts
+}
+fn report_sweep(tx: &Sender<Message>, scope: &str, sent: usize, total: usize) {
+    let _ = tx.send(Message::Sweep(SweepProgress {
+        scope: scope.into(),
+        sent,
+        total,
+    }));
 }
 fn interface_mac(interface: &NetworkInterface) -> Option<pnet_datalink::MacAddr> {
     let mac = interface.mac;
@@ -652,6 +1013,7 @@ fn arp_sweep(
     let mut next = Instant::now();
     let mut done = None;
     let mut replies = HashMap::<String, HashSet<Ipv4Addr>>::new();
+    report_sweep(tx, &n.cidr(), 0, hosts.len());
     while !stop.load(Ordering::Relaxed) {
         if index < hosts.len() && Instant::now() >= next {
             let ip = hosts[index];
@@ -678,6 +1040,9 @@ fn arp_sweep(
                 if !matches!(sender.send_to(&buffer, None), Some(Ok(()))) {
                     return false;
                 }
+            }
+            if done.is_none() && (index % 32 == 0 || index == hosts.len()) {
+                report_sweep(tx, &n.cidr(), index, hosts.len());
             }
             if index == hosts.len() {
                 if done.is_none() {
@@ -756,13 +1121,18 @@ fn fallback_sweep(n: &Network, hosts: Vec<Ipv4Addr>, tx: &Sender<Message>, stop:
     let Ok(sock) = UdpSocket::bind((n.address, 0)) else {
         return;
     };
-    for ip in hosts {
+    let total = hosts.len();
+    report_sweep(tx, &n.cidr(), 0, total);
+    for (index, ip) in hosts.into_iter().enumerate() {
         if stop.load(Ordering::Relaxed) {
             return;
         }
         let _ = sock.send_to(&[0], (ip, 9));
         if ip != n.address {
             let _ = tx.send(Message::Probe(ip, n.interface.clone()));
+        }
+        if (index + 1) % 32 == 0 || index + 1 == total {
+            report_sweep(tx, &n.cidr(), index + 1, total);
         }
         thread::sleep(Duration::from_millis(1000 / RATE));
     }
@@ -1055,11 +1425,17 @@ fn fingerprint_worker(
         }
     }
 }
-fn name_worker(rx: Receiver<ScanJob>, tx: Sender<Message>, stop: Arc<AtomicBool>) {
+fn name_worker(
+    rx: Receiver<ScanJob>,
+    tx: Sender<Message>,
+    stop: Arc<AtomicBool>,
+    running: Arc<AtomicUsize>,
+) {
     while !stop.load(Ordering::Relaxed) {
         let Ok((ip, iface, mac)) = rx.recv_timeout(Duration::from_millis(100)) else {
             continue;
         };
+        running.fetch_add(1, Ordering::Relaxed);
         if let Some(name) = crate::netbios::lookup(ip) {
             let mut o = Observation::new(ip, &iface);
             o.mac = mac.clone();
@@ -1093,6 +1469,7 @@ fn name_worker(rx: Receiver<ScanJob>, tx: Sender<Message>, stop: Arc<AtomicBool>
                 let _ = tx.send(Message::Enriched(o));
             }
         }
+        running.fetch_sub(1, Ordering::Relaxed);
     }
 }
 fn system_reverse_name(ip: Ipv4Addr, stop: &AtomicBool) -> Option<String> {
@@ -1449,6 +1826,7 @@ fn ping_worker(rx: Receiver<ScanJob>, tx: Sender<Message>, stop: Arc<AtomicBool>
             let o = Observation::new(ip, &iface);
             let _ = tx.send(Message::Found(o));
         }
+        let _ = tx.send(Message::ProbeDone(ip, iface));
     }
 }
 fn sleep_stop(stop: &AtomicBool, d: Duration) {
@@ -1469,6 +1847,112 @@ mod tests {
             vlan: None,
             routed: false,
         }
+    }
+    #[test]
+    #[ignore = "runs a targeted nmap scan against a loopback service"]
+    fn filter_worker_scans_the_requested_port() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+        if Command::new("nmap")
+            .arg("--version")
+            .stdout(Stdio::null())
+            .status()
+            .is_err()
+        {
+            return;
+        }
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let server_stop = stop.clone();
+        let server = thread::spawn(move || {
+            while !server_stop.load(Ordering::Relaxed) {
+                if let Ok((mut stream, _)) = listener.accept() {
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(300)));
+                    let mut input = [0; 1024];
+                    let _ = stream.read(&mut input);
+                    let _ = stream.write_all(
+                        b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                    );
+                } else {
+                    thread::sleep(Duration::from_millis(10));
+                }
+            }
+        });
+        let (jobs, rx) = bounded(1);
+        let (tx, updates) = unbounded();
+        let active = Arc::new(RwLock::new(vec![port]));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || filter_worker(rx, tx, worker_stop, true, active));
+        jobs.send(FilterJob {
+            ip: Ipv4Addr::LOCALHOST,
+            interface: "lo0".into(),
+            mac: None,
+            ports: vec![port],
+        })
+        .unwrap();
+        let mut found = false;
+        let mut success = false;
+        for _ in 0..2 {
+            match updates.recv_timeout(Duration::from_secs(55)).unwrap() {
+                Message::Enriched(o) => {
+                    assert_eq!(o.port_scope, [port]);
+                    found = o.ports.iter().any(|p| p.number == port);
+                }
+                Message::FilterDone(_, ok) => success = ok,
+                _ => panic!("unexpected filter worker event"),
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert!(found && success);
+    }
+    #[test]
+    fn matching_filter_revisits_devices_without_interrupting_inflight_scans() {
+        let mut store = DeviceStore::default();
+        let mut o = Observation::new("192.168.1.7".parse().unwrap(), "en0");
+        o.name = Some("Office printer".into());
+        store.observe(o);
+        let device = store.snapshot().remove(0);
+        let filter = DeviceFilter::parse("type:printer").unwrap();
+        assert!(filter_rescan_due(&filter, &device, None, false));
+        assert!(!filter_rescan_due(
+            &filter,
+            &device,
+            Some(&Instant::now()),
+            false
+        ));
+        assert!(!filter_rescan_due(&filter, &device, None, true));
+        let previous = Instant::now() - Duration::from_secs(121);
+        assert!(filter_rescan_due(&filter, &device, Some(&previous), false));
+        assert!(!filter_rescan_due(
+            &DeviceFilter::default(),
+            &device,
+            Some(&previous),
+            false
+        ));
+    }
+    #[test]
+    fn targeted_filters_schedule_unscanned_ports_and_retry_without_duplicates() {
+        let (tx, rx) = bounded(4);
+        let mut scheduler = FilterScheduler::new(tx);
+        let mut store = DeviceStore::default();
+        store.observe(Observation::new("192.168.1.7".parse().unwrap(), "en0"));
+        let device = store.snapshot().remove(0);
+        scheduler.set_filter(DeviceFilter::parse("type:printer port:62079").unwrap());
+        scheduler.schedule(&device);
+        scheduler.schedule(&device);
+        let job = rx.try_recv().unwrap();
+        assert_eq!(job.ports, [62079]);
+        assert!(rx.try_recv().is_err());
+        scheduler.complete(job, true);
+        scheduler.schedule(&device);
+        assert!(rx.try_recv().is_err());
+        scheduler.set_filter(DeviceFilter::parse("port:3389").unwrap());
+        scheduler.schedule(&device);
+        assert_eq!(rx.try_recv().unwrap().ports, [3389]);
     }
     #[test]
     fn fallback_probes_addresses_even_when_neighbor_cache_is_empty() {
@@ -1544,9 +2028,84 @@ mod tests {
         let first = targets_chunk(&n, 0).0;
         let next = targets_chunk(&n, 1).0;
         let wrap = targets_chunk(&n, 256).0;
-        assert_eq!(first[0], "192.168.31.1".parse::<Ipv4Addr>().unwrap());
-        assert_eq!(next[0], "192.168.32.1".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(first[0], "192.168.31.0".parse::<Ipv4Addr>().unwrap());
+        assert_eq!(next[0], "192.168.32.0".parse::<Ipv4Addr>().unwrap());
         assert_eq!(first, wrap);
+    }
+    #[test]
+    #[ignore = "runs a short discovery pass on the active local network"]
+    fn live_discovery_reaches_first_routed_subnet() {
+        let direct = networks();
+        let routed = crate::routes::discover(&direct, &[]);
+        let Some(wide) = routed.iter().find(|n| n.cidr() == "192.168.0.0/16") else {
+            return;
+        };
+        let target = (1..=31)
+            .map(|third| Ipv4Addr::new(192, 168, third, 1))
+            .find(|ip| {
+                !direct
+                    .iter()
+                    .any(|n| n.interface == wide.interface && n.contains(*ip))
+                    && crate::routes::route_interface(*ip).as_deref() == Some(&wide.interface)
+            });
+        let Some(target) = target else {
+            return;
+        };
+        let expected = format!("192.168.{}.0/24", target.octets()[2]);
+        let (tx, rx) = unbounded();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = stop.clone();
+        let worker = thread::spawn(move || discovery_loop(tx, worker_stop, vec![]));
+        let until = Instant::now() + Duration::from_secs(40);
+        let mut reached = false;
+        while Instant::now() < until {
+            if let Ok(Message::Sweep(progress)) = rx.recv_timeout(Duration::from_millis(200)) {
+                if progress.scope == expected {
+                    reached = true;
+                    break;
+                }
+            }
+        }
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        assert!(reached, "did not reach routed subnet {expected}");
+        println!("Reached routed subnet {expected}");
+    }
+    #[test]
+    fn routed_chunk_checks_the_actual_host_route_when_edge_uses_a_vpn() {
+        let mut n = net();
+        n.address = "192.168.0.0".parse().unwrap();
+        n.mask = "255.255.0.0".parse().unwrap();
+        n.routed = true;
+        let hosts = targets_chunk(&n, 0).0;
+        let result = reachable_routed_chunk("en0", hosts, |ip| {
+            Some(if ip.octets()[3] == 0 { "utun6" } else { "en0" }.into())
+        });
+        assert!(!result.contains(&"192.168.1.0".parse().unwrap()));
+        assert!(result.contains(&"192.168.1.1".parse().unwrap()));
+        assert!(result.contains(&"192.168.1.255".parse().unwrap()));
+    }
+    #[test]
+    fn routed_sixteen_starts_at_one_and_covers_all_24s() {
+        let mut n = net();
+        n.address = "192.168.0.0".parse().unwrap();
+        n.mask = "255.255.0.0".parse().unwrap();
+        n.routed = true;
+        assert_eq!(
+            targets_chunk(&n, 0).0[0],
+            "192.168.1.0".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            targets_chunk(&n, 30).0[0],
+            "192.168.31.0".parse::<Ipv4Addr>().unwrap()
+        );
+        assert_eq!(
+            targets_chunk(&n, 255).0[0],
+            "192.168.0.1".parse::<Ipv4Addr>().unwrap()
+        );
+        assert!(!targets_chunk(&n, 254)
+            .0
+            .contains(&"192.168.255.255".parse().unwrap()));
     }
     #[test]
     fn dhcp_router_must_be_on_the_interface_subnet() {
@@ -1564,7 +2123,7 @@ mod tests {
         assert_eq!(targets_chunk(&n, 0).0.len(), 254);
         n.mask = "255.0.0.0".parse().unwrap();
         assert!(targets_chunk(&n, 0).1);
-        assert_eq!(targets_chunk(&n, 0).0.len(), 254);
+        assert_eq!(targets_chunk(&n, 0).0.len(), 256);
     }
     #[test]
     fn parses_mac_and_skips_incomplete() {

@@ -92,7 +92,7 @@ fn parse_routes(text: &str, direct: &[Network], bsd: bool) -> Vec<Network> {
     result
 }
 
-fn route_interface(ip: Ipv4Addr) -> Option<String> {
+pub(crate) fn route_interface(ip: Ipv4Addr) -> Option<String> {
     #[cfg(target_os = "macos")]
     {
         let output = Command::new("/sbin/route")
@@ -152,7 +152,11 @@ pub fn discover(direct: &[Network], extra: &[String]) -> Vec<Network> {
             )
         })
         .unwrap_or_default();
-    for value in extra {
+    let mut requested = extra.to_vec();
+    if direct.iter().any(|n| n.address.octets()[..2] == [192, 168]) {
+        requested.push("192.168.0.0/16".into());
+    }
+    for value in &requested {
         let Ok((address, prefix)) = parse_subnet(value) else {
             continue;
         };
